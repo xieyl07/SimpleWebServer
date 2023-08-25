@@ -6,7 +6,6 @@
 #include <cstdarg>
 #include <csignal>
 #include <cerrno>
-#include "jemalloc/jemalloc.h"
 #include <vector>
 #include <string>
 #include <forward_list>
@@ -20,6 +19,7 @@
 #include <iostream>
 #include <functional>
 #include <tuple>
+#include <atomic>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -35,7 +35,7 @@
 #include <sys/resource.h>
 #include <netinet/in.h>
 
-#define release
+//#define release
 
 using namespace std;
 
@@ -45,6 +45,7 @@ enum TrigMode {EDGE, LEVEL};
 enum METHOD {GET, POST};
 enum LINE_STATE {OPEN, FIND_R, FIND};
 enum LINE_STAGE {REQ_LINE, HEADER, BODY};
+enum SOCK_STATE {S_ERR, S_AGAIN, S_FINISH};
 
 static const char * response_200 = "200 OK";
 static const char * response_301 = "301 Moved Permanently";
@@ -88,7 +89,7 @@ void response_print(int line_num, const char* func_name, const char *response_st
 #   define response_print(response_code, format, ...) \
         response_print(__LINE__, __FUNCTION__, response_##response_code, format, ##__VA_ARGS__);
 #else
-#   define deO(format, ...) ;
+#   define deO(format, ...) /* debug output */ ;
 #   define response_print(response_code, format, ...) ;
 #endif
 
@@ -108,7 +109,7 @@ struct Tuning {
     static constexpr int slot_num = 5; // 计时器
     static constexpr struct timeval tick_time = {1, 0}; // 计时器
     static constexpr int MAX_EVENTS_NUM = 100000; // Server
-# define ROOT_PATH "/home/c/root" /* HttpConn */
+# define ROOT_PATH "root" /* HttpConn */
     const struct rlimit nofile_limit = {150000, 200000}; // upscale_limit
     const struct rlimit nice_limit {25, 25}; // upscale_limit
 #   define NEWSOMAXCONN 40960 /* upscale_limit */
@@ -143,7 +144,7 @@ struct FileInfo {
     int fd;
     int size;
     char *addr;
-    int cnt = 1;
+    atomic_int cnt = 1;
     void callback() {
         --cnt;
     }
@@ -164,7 +165,7 @@ struct HttpConn {
 
     // parse result
     char *line_end;
-    LINE_STAGE line_stage = HEADER;
+    LINE_STAGE line_stage = REQ_LINE;
     LINE_STATE line_status = OPEN;
     METHOD method;
     const char *response_code;
@@ -179,9 +180,8 @@ struct HttpConn {
     const char *content_type = "text/html; charset=utf-8";
     string set_cookie = "";
     string location = "";
-//    int file_fd; // 要记得关闭
     int sent_len = 0;
-    FileInfo *f_info; // include char *addr, int size, int cnt
+    FileInfo *f_info = nullptr; // include char *addr, int size, int cnt
 };
 
 class Util {
@@ -202,9 +202,11 @@ class Util {
     static void clean(HttpConn *conn);
 
  private:
-    static bool send(HttpConn *conn);
+    static SOCK_STATE send(HttpConn *conn);
     static int epfd;
 };
+
+int Util::epfd;
 
 bool met_pipe = false;
 
@@ -361,7 +363,7 @@ class FileManager {
         deO("counterclockwise test finished")
         p = head->next;
         while (p != head) {
-            deO("node: %s %d %p %d", p->path.c_str(), p->fd, p->addr, p->size);
+            deO("node [%s]", p->path.c_str());
             p = p->next;
         }
         deO("clockwise test finished")
@@ -785,7 +787,9 @@ class HttpProcessor {
                     conn->response_code = response_200;
                     response(conn);
                 } else if (conn->rec_idx - conn->idx_to_check >= conn->post_content_len) { // post body
-                    // 第二次进, parse_line 开绿灯, 够走这里, 不够 break
+                    // 第一次长度不够 parse_line 返回 OPEN退出 run(),
+                    // 之后因为设置过 line_stage = BODY, parse_line 会永远返回FIND,
+                    // 要到这里判断长度. 不够return
                     process_body(conn, is_end, mysql_conn); // 解析完整的一行, 不用费心了
                     response(conn);
                 }
@@ -822,16 +826,13 @@ class HttpProcessor {
                 if (next_c == '\n') {
                     if (idx - 4 == conn->line_end) { // 读完最后一行(\r\n\r\n)了, 不需要is_end, 马上就出循环
                         conn->line_stage = BODY;
-                        deO("set empty line");
-                        if (conn->method == POST) {
-                            deO("%d", conn->rec_idx - idx);
-                            conn->idx_to_check += 2; // 第一次就数据够的话, FIND 出去, 两个 else 到 process_body 出去
-                            if (conn->rec_idx < idx + conn->post_content_len) { // 第一次不够的话, OPEN 出去直接 break 等下次
-                                deO("");
-                                // 要 return 了, 把落下的补上
-                                *(conn->line_end = idx - 2) = '\0';
-                                return OPEN; // 长度不够直接退出循环
-                            }
+                        deO("in body");
+                        if (conn->method == POST && // POST 的都会idx_to_check += 2
+                            conn->rec_idx < (conn->idx_to_check += 2) + conn->post_content_len) {
+                            deO("not enough, len is %d", conn->rec_idx - idx);
+                            // 要 return 了, 把落下的补上
+                            *(conn->line_end = idx - 2) = '\0';
+                            return OPEN; // 长度不够退出do while循环, 等下次EPOLLIN
                         }
                     } else if (idx == end) {
                         is_end = true;
@@ -985,7 +986,7 @@ class HttpProcessor {
         } else if (conn->file_path == "signup") {
             keys = {"usr=", "passwd="};
             post_type = 2;
-        } else { // post 的 file_path 的合法性在 parse_req_line 那里检验, 这个 else 就是摆设, 忘记写的时候的提醒
+        } else { // post 的 file_path 的合法性在 process_req_line 那里检验, 这个 else 就是摆设, 忘记写的时候的提醒
             deO("code error, never get here");
             return;
         }
@@ -1096,17 +1097,23 @@ class HttpProcessor {
         // 头部. 因为头部要用到body长度, 所以放后面
         deO("%s", conn->response_code)
         char *&idx_to_write = conn->idx_to_write;
-        idx_to_write += sprintf(idx_to_write, "HTTP/1.1 %s\r\n", conn->response_code);
-        idx_to_write += sprintf(idx_to_write, "Content-Type: %s\r\n", conn->content_type);
-        idx_to_write += sprintf(idx_to_write, "Content-Length: %d\r\n", conn->f_info->size);
+        idx_to_write += sprintf(idx_to_write, "HTTP/1.1 %s\r\n",
+                                conn->response_code);
+        idx_to_write += sprintf(idx_to_write, "Content-Type: %s\r\n",
+                                conn->content_type);
+        idx_to_write += sprintf(idx_to_write, "Content-Length: %d\r\n",
+                                conn->f_info->size);
         if (!conn->connection.empty()) {
-            idx_to_write += sprintf(idx_to_write, "Connection: %s\r\n", conn->connection.c_str());
+            idx_to_write += sprintf(idx_to_write, "Connection: %s\r\n",
+                                    conn->connection.c_str());
         }
         if (!conn->set_cookie.empty()) {
-            idx_to_write += sprintf(idx_to_write, "set-cookie: %s\r\n", conn->set_cookie.c_str());
+            idx_to_write += sprintf(idx_to_write, "set-cookie: %s\r\n",
+                                    conn->set_cookie.c_str());
         }
         if (!conn->location.empty()) {
-            idx_to_write += sprintf(idx_to_write, "location: %s\r\n", conn->location.c_str());
+            idx_to_write += sprintf(idx_to_write, "location: %s\r\n",
+                                    conn->location.c_str());
         }
         idx_to_write += sprintf(idx_to_write, "\r\n");
 
@@ -1124,7 +1131,7 @@ const unordered_set<string> HttpProcessor::allowed_post_path = {"login", "signup
 
 class Server : public NoCopy {
  public:
-    Server() : port(tuning.port), connfd_trig(tuning.connfd_trig), actor_model(tuning.actor_model) {
+    Server() : port(tuning.port), actor_model(tuning.actor_model) {
         conns = new HttpConn[tuning.nofile_limit.rlim_cur];
     }
     void run() {
@@ -1164,7 +1171,7 @@ class Server : public NoCopy {
             exit(1);
         }
         Util::reg_epfd(epfd);
-        Util::add_fd(listenfd, EPOLLIN, LEVEL, false);
+        Util::add_fd(listenfd, EPOLLIN, tuning.connfd_trig, false);
         struct epoll_event events[MAX_EVENTS]; // 放epoll_wait得到的的结果用
 
         while (true) {
@@ -1181,7 +1188,7 @@ class Server : public NoCopy {
                                         (struct sockaddr *) &client_addr,
                                         &client_addr_len);
                     Util::set_noblock(sockfd);
-                    Util::add_fd(sockfd, EPOLLIN, connfd_trig, true);
+                    Util::add_fd(sockfd, EPOLLIN, tuning.connfd_trig, true);
                     Util::init(conns + sockfd);
 
                 } else if(events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
@@ -1227,7 +1234,6 @@ class Server : public NoCopy {
     // 由 tuning 控制的常量
     int port;
     ActorModel actor_model;
-    TrigMode connfd_trig;
     HttpConn* conns;
 };
 
@@ -1405,19 +1411,23 @@ void Util::return_sql_conn(MYSQL *conn) {
 
 void Util::init(HttpConn *http_conn) {
     deO("init")
+
     http_conn->idx_to_check = http_conn->rec_buf;
     http_conn->rec_idx = http_conn->rec_buf;
     http_conn->idx_to_write = http_conn->send_buf;
     http_conn->send_idx = http_conn->send_buf;
-    http_conn->line_stage = HEADER;
+
+    http_conn->line_stage = REQ_LINE;
     http_conn->line_status = OPEN;
     http_conn->connection.clear();
     http_conn->cookie.clear();
-    http_conn->post_content_len = 0;
+    http_conn->post_content_len = 0; // 字段都要初始化, 防止没读取到
+
     http_conn->content_type = "text/html; charset=utf-8";
     http_conn->set_cookie.clear();
     http_conn->location.clear();
     http_conn->sent_len = 0;
+    http_conn->f_info = nullptr;
 }
 
 bool Util::recv(HttpConn *http_conn) {
@@ -1463,14 +1473,15 @@ bool Util::recv(HttpConn *http_conn) {
 
 void Util::deal_out(HttpConn *conn, MYSQL*) {
     deO("")
-    if (!send(conn)) {
+    SOCK_STATE state = send(conn);
+    if (state == S_ERR) {
         clean(conn);
         close(conn->connfd);
         return;
-    }
-    if (conn->sent_len == conn->f_info->size) {
-        clean(conn);
-        if (!conn->connection.empty() && conn->connection[0] == 'k') { // // keep-alive省掉了连接, 必须把listenfd那里的步骤全部补上
+    } else if (state == S_FINISH) {
+        clean(conn); // 把clean放到send里也可以, 现在这么写只是遵循close之前清场
+        if (!conn->connection.empty() && conn->connection[0] == 'k') { // keep-alive
+            // keep-alive省掉了连接, 必须把listenfd那里的步骤全部补上
             Util::mod_fd(conn->connfd, EPOLLIN, tuning.connfd_trig, true);
             init(conn);
         } else {
@@ -1479,7 +1490,7 @@ void Util::deal_out(HttpConn *conn, MYSQL*) {
     }
 }
 
-bool Util::send(HttpConn *conn) {
+SOCK_STATE Util::send(HttpConn *conn) {
     using ::send;
 
     const int connfd = conn->connfd;
@@ -1490,11 +1501,9 @@ bool Util::send(HttpConn *conn) {
 
         if (ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             mod_fd(connfd, EPOLLOUT, tuning.connfd_trig, true);
-            // EAGAIN不callback
-            return true;
+            return S_AGAIN;
         } else if (ret == 0 || ret == -1) {
-            conn->f_info->callback();
-            return false;
+            return S_ERR;
         }
         send_idx += ret; // send_idx 是个引用
     }
@@ -1502,29 +1511,31 @@ bool Util::send(HttpConn *conn) {
 
     int &sent_len = conn->sent_len;
     const int map_len = conn->f_info->size;
-    deO("sent_len: %d, map_len: %d", conn->sent_len, conn->map_len);
+    deO("sent_len: %d, map_len: %d", conn->sent_len, map_len);
     while (sent_len < map_len) {
-        deO("sent_len: %d, map_len: %d", conn->sent_len, conn->map_len)
+        deO("sent_len: %d, map_len: %d", conn->sent_len, map_len)
         int ret = send(connfd, conn->f_info->addr + sent_len, map_len - sent_len, 0);
 
         if (ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             mod_fd(connfd, EPOLLOUT, tuning.connfd_trig, true);
-            return true;
+            return S_AGAIN;
         } else if (ret == 0 || ret == -1) {
-            conn->f_info->callback();
-            return false;
+            return S_ERR;
         }
         sent_len += ret; // send_idx 是个引用
     }
     deO("")
 
-    conn->f_info->callback();
-    return true;
+    return S_FINISH;
 }
 
 void Util::clean(HttpConn *conn) {
 //    munmap(conn->file_map, conn->map_len);
 //    close(conn->file_fd);
+    if (conn->f_info) {
+        conn->f_info->callback();
+        conn->f_info = nullptr;
+    }
 }
 
 int main(int argc, char *argv[]) {

@@ -1,4 +1,4 @@
-# WebServer
+# SimpleWebServer
 
 ## 简介
 一个用c++实现的简单WebServer, 运用IO复用机制和事件循环实现高性能(epoll的LT和ET模式, 以及Reactor/Proactor模式). 用状态机解析HTTP请求, 并使用LRU缓存页面, 线程池和异步日志等机制来提高性能. 最终在本机ab测试下, 各种模式均可达到近万qps.
@@ -11,7 +11,7 @@
 调试: `curl -i -X GET localhost:8010/ HTTP/1.1`和`curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`和浏览器F12.  
 压力测试: `ab -n 10000 -c 100 http://127.0.0.1:8010/`
 
-### 参数说明:  
+### 参数说明:
 > -p \<port>  
 > -t <thread_num>  
 > -T <connfd_trig(0:L 1:E)>  
