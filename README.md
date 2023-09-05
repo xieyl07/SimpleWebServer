@@ -1,14 +1,15 @@
 # SimpleWebServer
 
 ## 简介
-一个用c++实现的简单WebServer, 运用IO复用机制和事件循环实现高性能(epoll的LT和ET模式, 以及Reactor/Proactor模式). 用状态机解析HTTP请求, 并使用LRU缓存页面, 线程池和异步日志等机制来提高性能. 最终在本机ab测试下, 各种模式均可达到近万qps.
-
-功能上, 服务器能响应GET和POST方法的请求, 实现注册和登录功能.
+&nbsp;&nbsp;&nbsp;&nbsp;一个用c++实现的简单WebServer, 运用IO复用机制和事件循环(epoll的LT和ET模式, 以及Reactor/Proactor模式)处理非阻塞IO, 实现高性能.  
+&nbsp;&nbsp;&nbsp;&nbsp;用状态机解析HTTP请求, 能响应GET和POST方法并支持登录注册功能, 使用cookie来验证登录信息.  
+&nbsp;&nbsp;&nbsp;&nbsp;使用LRU缓存, 线程池, 异步日志, 自旋锁和无锁队列等机制来提高性能.  
+&nbsp;&nbsp;&nbsp;&nbsp;最终在本机(4核ryzen 3550H, linux 6.4.11-arch2-1)使用apache ab测试, 各种模式均可达到近万qps.
 
 ## 使用方法
 编译: `g++ -lmysqlclient -o server main.cpp`  
-运行: `sudo ./server -p 8011 -A 0`  
-调试: `curl -i -X GET localhost:8010/ HTTP/1.1`和`curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`和浏览器F12.  
+运行: `sudo ./server -p 8010 -A 0`  
+调试工具: `curl -i -X GET localhost:8010/ HTTP/1.1`, `curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`, 浏览器F12.  
 压力测试: `ab -n 10000 -c 100 http://127.0.0.1:8010/`
 
 ### 参数说明:

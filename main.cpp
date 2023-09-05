@@ -20,6 +20,7 @@
 #include <functional>
 #include <tuple>
 #include <atomic>
+#include <random>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -34,6 +35,8 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#include <hiredis/hiredis.h>
+
 
 //#define release
 
@@ -120,6 +123,7 @@ struct Tuning {
 #   define db_name "serverdb" /* mysql */
 #   define mysql_ip "localhost" /* mysql */
 #   define MAX_EVENTS 18 /* epoll_event */
+#   define EXPIRE_TIME 60
 };
 
 Tuning tuning;
@@ -196,10 +200,27 @@ class Util {
     static void finish(int);
     static MYSQL* get_sql_conn();
     static void return_sql_conn(MYSQL *conn);
+    static redisContext* get_redis_conn();
+    static void return_redis_conn(redisContext *conn);
     static void init(HttpConn *http_conn);
     static bool recv(HttpConn *conn);
-    static void deal_out(HttpConn *conn, MYSQL*);
+    static void deal_out(HttpConn *conn, MYSQL*, redisContext*);
     static void clean(HttpConn *conn);
+    static int get_random(int limit) {
+        // 使用 random_device 作为种子
+        std::random_device rd;
+        std::mt19937 generator(rd());
+
+        // 定义随机数分布范围为 0 到 limit
+        std::uniform_int_distribution<int> distribution(0, limit);
+
+        // 生成随机数
+        return distribution(generator);
+    }
+    static string generate_cookie(const string &user_name) {
+        string s2 = to_string(get_random(99)) + "=" + to_string(clock());
+        return user_name + s2;
+    }
 
  private:
     static SOCK_STATE send(HttpConn *conn);
@@ -333,28 +354,33 @@ class FileManager {
     }
     FileManager() : FileManager(1024) {}
 
- public:
     FileInfo* get_file(const string &full_path) {
+        mtx.lock();
         test_list();
         auto it = hash_map.find(full_path);
         if (it == hash_map.end()) {
             deO("not in lru");
-            return real_add(full_path);
+            FileInfo *ret = real_add(full_path);
+            mtx.unlock();
+            return ret;
         }
         deO("find in lru");
         FileInfo *node = it->second;
         ++node->cnt;
         if (node == head->next) { // 不要也能正常工作
+            mtx.unlock();
             return node;
         }
         link(node->prev, node->next);
         link(node, head->next);
         link(head, node);
+        mtx.unlock();
         return node;
     }
 
  private:
     void test_list() {
+#ifndef release
         FileInfo *p = head->prev;
         while (p != head) {
             deO("a new node, %s %d %p %d", p->path.c_str(), p->fd, p->addr, p->size);
@@ -367,6 +393,7 @@ class FileManager {
             p = p->next;
         }
         deO("clockwise test finished")
+#endif
     }
     FileInfo* real_add(const string &full_path) {
         FileInfo *node = open_path(full_path);
@@ -394,7 +421,7 @@ class FileManager {
 //                hash_map.erase(p->path);
 //                usage -= p->size;
 //                remove_node(p);
-                ;
+            ;
 //            }
         }
 
@@ -436,6 +463,7 @@ class FileManager {
     int capacity; // <=0 则不设置最大长度
     FileInfo *head = new FileInfo;
     unordered_map<string, FileInfo*> hash_map;
+    Mutex mtx;
 };
 
 FileManager file_manager;
@@ -526,7 +554,7 @@ class Log {
 
         if (async_log) {
             // 别的不说, 写入blocks当然要上锁
-            mtx.lock();
+            lock.lock();
             // 检查是不是需要n printf
             // printf 返回的长度不包含'\0'
             int len0 = sprintf(str0,"%d-%02d-%02d %02d:%02d:%02d.%06ld %s ",
@@ -554,7 +582,7 @@ class Log {
                 write_idx = 0;
             }
             write_idx += sprintf(blocks[block_write_idx] + write_idx, str_format);
-            mtx.unlock();
+            lock.unlock();
         } else { // sync write
             // 因为c标准库的io有缓冲区, 每次fprintf/fwrite写入不涉及系统调用,
             // 所以多次fprintf而不是都写入到一个字符串里再fprintf.
@@ -619,7 +647,7 @@ class Log {
     char *str0; // 每一行的日期和等级部分
     char *str_format;
     bool async_write_finish = true;
-    Mutex mtx;
+    SpinLock lock;
     RwLock rwlock;
 };
 
@@ -641,7 +669,7 @@ class Log {
 /***************** thread pool *****************/
 
 class ThreadPool {
-    using func_t = std::pair<void(*)(HttpConn*, MYSQL*), HttpConn*>;
+    using func_t = std::pair<void(*)(HttpConn*, MYSQL*, redisContext*), HttpConn*>;
  public:
     static ThreadPool& get_instance() {
         static ThreadPool pool;
@@ -655,6 +683,7 @@ class ThreadPool {
         auto thread_func = [this]() {
             MYSQL *conn = Util::get_sql_conn();
 //            MYSQL *conn = nullptr; // ###for test_list
+            redisContext *redisconn = Util::get_redis_conn();
             while (!stop) {
                 // 上来就检查tasks, 非空就执行
                 // 不要有了通知才运行.
@@ -680,9 +709,10 @@ class ThreadPool {
                 func_t obj = tasks.front();
                 tasks.pop();
                 mtx.unlock();
-                obj.first(obj.second, conn);
+                obj.first(obj.second, conn, redisconn);
             }
             Util::return_sql_conn(conn);
+            Util::return_redis_conn(redisconn);
         };
 
         // start_pool 就这么一个for
@@ -724,7 +754,7 @@ class ThreadPool {
 // processor 是无状态的
 class HttpProcessor {
  public:
-    static void run(HttpConn* conn, MYSQL *mysql_conn) {
+    static void run(HttpConn* conn, MYSQL *mysql_conn, redisContext *redisconn) {
         if (tuning.actor_model == REACTOR) {
             bool result = Util::recv(conn);
             if (!result) {
@@ -745,7 +775,10 @@ class HttpProcessor {
         // 只有 FIND 才可能没走到底
         do {
             line_state = parse_line(conn, line_state, is_end);
-            if (line_state != FIND) break; // 没找到说明走到底了
+            if (line_state != FIND) {
+                deO("")
+                break; // 没找到说明走到底了
+            }
 #ifndef release
             if (conn->line_stage == BODY && conn->method == POST) {
                 char str[100];
@@ -773,6 +806,7 @@ class HttpProcessor {
             }
             case HEADER:
             {
+                deO("case HEADER")
                 bool result = process_header(conn);
                 if (!result) {
                     response(conn);
@@ -782,15 +816,40 @@ class HttpProcessor {
             }
             case BODY:
             {
-                deO("in body")
+                deO("case BODY")
                 if (conn->method == GET) {
-                    conn->response_code = response_200;
+                    deO("[%s]", conn->file_path.c_str())
+                    if (auth_pages.find(conn->file_path) != auth_pages.end()) {
+                        deO("authing")
+                        if (conn->cookie.empty()) {
+                            response_code_set(conn, 403);
+                            deO("authing fail")
+                        } else {
+                            redisReply *reply
+                                = (redisReply*)redisCommand(redisconn, "GET %s",
+                                                            conn->cookie.c_str());
+                            if (!reply) {
+                                deO("exit!")
+                                exit(1);
+                            }
+                            if (reply->type == REDIS_REPLY_NIL) {
+                                response_code_set(conn, 403);
+                                deO("authing fail")
+                            } else {
+                                conn->response_code = response_200;
+                                deO("authing success")
+                            }
+                        }
+
+                    } else {
+                        conn->response_code = response_200;
+                    }
                     response(conn);
                 } else if (conn->rec_idx - conn->idx_to_check >= conn->post_content_len) { // post body
                     // 第一次长度不够 parse_line 返回 OPEN退出 run(),
                     // 之后因为设置过 line_stage = BODY, parse_line 会永远返回FIND,
                     // 要到这里判断长度. 不够return
-                    process_body(conn, is_end, mysql_conn); // 解析完整的一行, 不用费心了
+                    process_body(conn, is_end, mysql_conn, redisconn); // 解析完整的一行, 不用费心了
                     response(conn);
                 }
 
@@ -945,7 +1004,15 @@ class HttpProcessor {
             return false;
         }
         if (strcasecmp(key, "Cookie") == 0) {
-            conn->cookie = value;
+            deO("deal cookie")
+            char *token = strstr(value, "token=");
+            if(token) {
+            deO("token is: %s", token)
+                token += 6;
+                char *token_end = std::find(token, conn->line_end, ':');
+                if (token_end != conn->line_end) *token_end = '\0';
+                conn->cookie = token;
+            }
         } else if (strcasecmp(key, "Connection") == 0) {
             if (strcasecmp(value, "keep-alive") == 0) {
                 conn->connection = "keep-alive";
@@ -971,7 +1038,7 @@ class HttpProcessor {
         conn->idx_to_check = conn->line_end + 2;
         return true;
     }
-    static void process_body(HttpConn *conn, bool &is_end, MYSQL *mysql_conn) {
+    static void process_body(HttpConn *conn, bool &is_end, MYSQL *mysql_conn, redisContext *redisconn) {
         deO("get and process hole post body");
 
         // alias, 要么const要么引用
@@ -991,6 +1058,7 @@ class HttpProcessor {
             return;
         }
         const unsigned key_num = keys.size();
+        // usr=values[0]&passwd=values[1], values[0]是账号, values[1]是密码
         vector<const char*> values(key_num);
 
         for (int i = 0; i < key_num; ++i) {
@@ -1001,7 +1069,8 @@ class HttpProcessor {
                 response_print(400, "POST body key incorrect");
                 return;
             }
-            // 当然用 strncmp 了! idx_to_check 的最后又没有改成'\0', 一个字符串和另一个的一部分是否相等用 strncmp
+            // 当然用 strncmp 了! idx_to_check 的最后又没有改成'\0',
+            // 一个字符串和另一个的一部分是否相等用 strncmp
             if (strncmp(keys[i], idx_to_check, key_len) != 0) {
                 response_code_set(conn, 400);
                 response_print(400, "POST body key incorrect");
@@ -1040,8 +1109,20 @@ class HttpProcessor {
             if (mysql_num_rows(res) == 0) {
                 conn->location = "/error.html";
 //                return;
-            } else {
+            } else { // login success
                 conn->location = "/welcome.html";
+                string ck = Util::generate_cookie(values[0]);
+                auto reply = redisCommand(redisconn, "SETEX %s %d 1",
+                                          ck.c_str(), EXPIRE_TIME);
+                if (!reply) {
+                    deO("exit!")
+                    exit(1);
+                }
+                char setCookie[100];
+                snprintf(setCookie, sizeof(setCookie),
+                         "token=%s; Max-Age=%d; Secure; HttpOnly; Path=/",
+                         ck.c_str(), EXPIRE_TIME);
+                conn->set_cookie = setCookie;
 //                return;
             }
 
@@ -1053,8 +1134,20 @@ class HttpProcessor {
             (add_user += values[1]) += "');";
 
             int ret = mysql_query(mysql_conn, add_user.c_str());
-            if (ret == 0) {
+            if (ret == 0) { // signup success
                 conn->location = "/welcome.html";
+                string ck = Util::generate_cookie(values[0]);
+                auto reply = redisCommand(redisconn, "SETEX %s %d 1",
+                                          ck.c_str(), EXPIRE_TIME);
+                if (!reply) {
+                    deO("exit!")
+                    exit(1);
+                }
+                char setCookie[100];
+                snprintf(setCookie, sizeof(setCookie),
+                         "token=%s; Max-Age=%d; Secure; HttpOnly; Path=/",
+                         ck.c_str(), EXPIRE_TIME);
+                conn->set_cookie = setCookie;
 //                return;
             } else {
                 conn->location = "/error.html";
@@ -1108,7 +1201,7 @@ class HttpProcessor {
                                     conn->connection.c_str());
         }
         if (!conn->set_cookie.empty()) {
-            idx_to_write += sprintf(idx_to_write, "set-cookie: %s\r\n",
+            idx_to_write += sprintf(idx_to_write, "Set-Cookie: %s\r\n",
                                     conn->set_cookie.c_str());
         }
         if (!conn->location.empty()) {
@@ -1122,9 +1215,11 @@ class HttpProcessor {
     }
 
     static const unordered_set<string> allowed_post_path;
+    static const unordered_set<string> auth_pages;
 };
 
 const unordered_set<string> HttpProcessor::allowed_post_path = {"login", "signup"};
+const unordered_set<string> HttpProcessor::auth_pages = {"welcome.html", "pic.html", "picBig.html", "picBig.png", "pic.jpg"};
 
 
 /***************** network *****************/
@@ -1150,7 +1245,7 @@ class Server : public NoCopy {
         server_addr.sin_port = htons(port);
         if (bind(listenfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
             // error handle
-            deO("exit")
+            deO("bind error, change port? exit")
             exit(1);
         }
 
@@ -1217,7 +1312,7 @@ class Server : public NoCopy {
                     // 可以多次发送, 而且已经设置过非阻塞了
                     deO("EPOLLOUT")
                     if (actor_model == PROACTOR) {
-                        Util::deal_out(conns + eventfd, nullptr);
+                        Util::deal_out(conns + eventfd, nullptr, nullptr);
                     } else {
                         ThreadPool::get_instance().add_task({Util::deal_out,
                                                              conns + eventfd});
@@ -1262,7 +1357,7 @@ void Util::arg_parse(int argc, char *argv[]) {
                 printf("argument %s of option -%c is illegal, using default instead\n", optarg, opt);
             }
             break;
-       case 'T':
+        case 'T':
             if (tmp == 0 || tmp == 1) {
                 tuning.connfd_trig = tmp == 1 ? EDGE : LEVEL;
             } else {
@@ -1409,6 +1504,24 @@ void Util::return_sql_conn(MYSQL *conn) {
     mysql_close(conn);
 }
 
+redisContext* Util::get_redis_conn() {
+    redisContext *context = redisConnect("localhost", 6379);
+    if (!context || context->err) {
+        if (context) {
+            deO("error connecting to redis: %s", context->errstr)
+            redisFree(context);
+        } else {
+            deO("could not allocate redis context.")
+        }
+        exit(1);
+    }
+    return context;
+}
+
+void Util::return_redis_conn(redisContext *conn) {
+    redisFree(conn);
+}
+
 void Util::init(HttpConn *http_conn) {
     deO("init")
 
@@ -1471,7 +1584,7 @@ bool Util::recv(HttpConn *http_conn) {
     return true;
 }
 
-void Util::deal_out(HttpConn *conn, MYSQL*) {
+void Util::deal_out(HttpConn *conn, MYSQL*, redisContext*) {
     deO("")
     SOCK_STATE state = send(conn);
     if (state == S_ERR) {
@@ -1556,7 +1669,7 @@ struct BaseNode {
     explicit BaseNode(T val) : val(val) {}
 
     T val;
-    NT *prev = nullptr;
+    NT *prev =  nullptr;
     NT *next = nullptr;
 };
 
@@ -1568,7 +1681,7 @@ struct ListNode : public BaseNode<T, ListNode<T>> {
 struct FileNode : public BaseNode<string, FileNode> {
     FileNode() = default;
     FileNode(const string &path, int fd, char *addr, int size)
-      : BaseNode(path), fd(fd), addr(addr), size(size) {}
+            : BaseNode(path), fd(fd), addr(addr), size(size) {}
     int fd;
     char *addr;
     int size;
