@@ -7,7 +7,7 @@
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;最终在本机(4核8线程)使用apache ab测试, 各种模式均可达到近万qps.
 
 ## 使用方法
-编译: `g++ -lmysqlclient -o server main.cpp`  
+编译: `g++ -lmysqlclient -lhiredis -o server main.cpp`  
 运行: `sudo ./server -p 8010 -A 0`  
 调试工具: `curl -i -X GET localhost:8010/ HTTP/1.1`, `curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`, 浏览器F12.  
 压力测试: `ab -n 10000 -c 100 http://127.0.0.1:8010/`
@@ -27,6 +27,7 @@
 ![pic](mdRes/pic.png)
 ![picBig](mdRes/picBig.png)
 ![404](mdRes/404.png)
+![403](mdRes/403.png)
 
 ## 测试结果(Proactor+ET模式):
 ```shell
