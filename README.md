@@ -1,10 +1,10 @@
 # SimpleWebServer
 
 ## 简介
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;一个用c++实现的简单WebServer, 运用IO复用机制和事件循环(epoll的LT和ET模式, 以及Reactor/Proactor模式)处理非阻塞IO, 实现高性能.  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;用状态机解析HTTP请求, 能正确响应GET和POST方法, 查看尺寸大于缓冲区的图片. 支持登录注册功能, 并且使用cookie来验证登录信息.  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;使用LRU缓存, 线程池, 异步日志等机制来提高性能.  
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;最终在本机(4核8线程)使用apache ab测试, 各种模式均可达到近万qps.
+- 一个用c++实现的简单WebServer, 运用IO复用机制和事件循环(epoll的LT和ET模式, 以及Reactor/Proactor模式)处理非阻塞IO, 实现高性能.  
+- 用状态机解析HTTP请求, 能正确响应GET和POST方法, 查看尺寸大于缓冲区的图片. 支持登录注册功能, 并且使用cookie来验证登录信息.  
+- 使用LRU缓存, 线程池, 异步日志等机制来提高性能.  
+- 最终在本机(4核8线程)使用apache ab测试, 各种模式均可达到近万qps.
 
 ## 使用方法
 编译: `g++ -lmysqlclient -lhiredis -o server main.cpp`  
@@ -30,7 +30,7 @@
 ![403](mdRes/403.png)
 
 ## 测试结果(Proactor+ET模式):
-```shell
+```
 $ ab -n 100000 -c 200 http://127.0.0.1:8012/
 
 Server Software:        
