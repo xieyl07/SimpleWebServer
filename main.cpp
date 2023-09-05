@@ -1308,8 +1308,8 @@ class Server : public NoCopy {
 
                 } else if (events[i].events & EPOLLOUT) { // 要发回数据了
                     // 为什么不直接发送, 要用EPOLLOUT:
-                    // 并发量大的话, 缓冲区肯定会满的啊, 满了总不能干等着吧
-                    // 可以多次发送, 而且已经设置过非阻塞了
+                    // 一个连接一个缓冲区不担心满, 但是发大文件肯定会满
+                    // 因为设置过非阻塞了, 可以多次发送
                     deO("EPOLLOUT")
                     if (actor_model == PROACTOR) {
                         Util::deal_out(conns + eventfd, nullptr, nullptr);
