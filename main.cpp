@@ -1178,7 +1178,7 @@ class HttpProcessor {
             conn->file_path = "404.html";
             break;
         default:
-            // never get here
+            assert(false);
             break;
         }
         conn->full_path = conn->root_path + conn->file_path;
@@ -1643,7 +1643,7 @@ SOCK_STATE Util::send(HttpConn *conn) {
 }
 
 void Util::clean(HttpConn *conn) {
-//    munmap(conn->file_map, conn->map_len);
+//    munmap(conn->file_map, conn->map_len); // 如果不用 lru 的话
 //    close(conn->file_fd);
     if (conn->f_info) {
         conn->f_info->callback();
@@ -1759,6 +1759,7 @@ class LRU {
     unordered_map<T, NT*> hash_map;
 };
 
+// template模式. 应该上面 LRU 的 rm_node 这些要改成纯虚函数接口吧###
 class FileLRU : public LRU<string, FileNode> {
  protected:
     void rm_node(FileNode *tmp) { // override

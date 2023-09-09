@@ -6,6 +6,8 @@
 - 使用LRU缓存, 线程池, 异步日志等机制来提高性能.  
 - 最终在本机(4核8线程)使用apache ab测试, 各种模式均可达到近万qps.
 
+吐槽一下, 虽然看上去很像, 结果和readme都很像, 代码纯自己写的. TinyWebServer的代码几个月以前读了一半, 再之前认真读了游双的代码, 后面没碰过. 有疑问问gpt, 结构有参考所以像, 但是逻辑又不复杂很好写的.
+
 ## 使用方法
 编译: `g++ -lmysqlclient -lhiredis -o server main.cpp`  
 运行: `sudo ./server -p 8010 -A 0`  
