@@ -11,7 +11,7 @@
 ## 使用方法
 编译: `g++ -lmysqlclient -lhiredis -o server main.cpp`  
 运行: `sudo ./server -p 8010 -A 0`  
-调试工具: `curl -i -X GET localhost:8010/ HTTP/1.1`, `curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`, 浏览器F12.  
+调试工具: `curl -i -X GET localhost:8010/ HTTP/1.1`, `curl -i -X POST localhost:8010/login HTTP/1.1 -d 'usr=u&passwd=p'`, `tcpdump -vn 'port 8011'`, 浏览器F12.  
 压力测试: `ab -n 10000 -c 100 http://127.0.0.1:8010/`
 
 ### 参数说明:
